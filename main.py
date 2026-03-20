@@ -232,6 +232,7 @@ search_tool = DuckDuckGoSearchRun()
 
 @tool
 def BookSearch(query: str) -> str:
+    """Search Google Books and return one recommended title."""
     print(f"[Tool] BookSearch called with query: {query}")
 
     url = "https://www.googleapis.com/books/v1/volumes"
@@ -258,6 +259,7 @@ def BookSearch(query: str) -> str:
 
 @tool
 def calculator(a: float, b: float, operation: str = "add") -> str:
+    """Perform basic arithmetic: add, subtract, multiply, or divide."""
     print(f"[Tool] Calculator: {a} {operation} {b}")
 
     if operation == "add":
@@ -274,6 +276,7 @@ def calculator(a: float, b: float, operation: str = "add") -> str:
 
 @tool
 def save_conversation(filename: str = "conversation.txt") -> str:
+    """Save the current in-memory conversation to a text file."""
     global conversation
 
     folder = "history_conversation"
