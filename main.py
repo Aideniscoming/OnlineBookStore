@@ -206,6 +206,9 @@ from langgraph.prebuilt import create_react_agent
 # Load environment variables
 # ---------------------------
 load_dotenv()
+if not os.getenv("OPENAI_API_KEY") and os.getenv("OPEN_API_KEY"):
+    # Backward-compatible alias for older env var naming in this project.
+    os.environ["OPENAI_API_KEY"] = os.getenv("OPEN_API_KEY", "")
 
 # ---------------------------
 # FastAPI app
@@ -313,6 +316,24 @@ agent = create_react_agent(llm, tools=tools, prompt=system_instructions)
 class ChatRequest(BaseModel):
     message: str
     history: list = []
+
+# ---------------------------
+# Basic status endpoints
+# ---------------------------
+@app.get("/")
+def root():
+    return {
+        "status": "ok",
+        "service": "AI_assistance API",
+        "docs": "/docs",
+        "chat_endpoint": "/chat",
+    }
+
+
+@app.get("/health")
+def health():
+    return {"status": "healthy"}
+
 
 # ---------------------------
 # Chat endpoint
