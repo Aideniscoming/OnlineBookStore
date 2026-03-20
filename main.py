@@ -235,26 +235,96 @@ search_tool = DuckDuckGoSearchRun()
 
 @tool
 def BookSearch(query: str) -> str:
-    """Search Google Books and return one recommended title."""
+    """Search Google Books and return curated book recommendations with details."""
     print(f"[Tool] BookSearch called with query: {query}")
 
     url = "https://www.googleapis.com/books/v1/volumes"
-    params = {"q": query, "maxResults": 1, "printType": "books"}
+    clean_query = query.strip()
+    if not clean_query:
+        return "Please provide a topic, title, or author so I can search for books."
+
+    params = {
+        "q": clean_query,
+        "maxResults": 5,
+        "printType": "books",
+        "orderBy": "relevance",
+        "langRestrict": "en",
+    }
 
     try:
-        response = requests.get(url, params=params)
+        response = requests.get(url, params=params, timeout=12)
         response.raise_for_status()
         data = response.json()
 
-        if "items" not in data:
-            return f"No books found for '{query}'"
+        items = data.get("items", [])
+        if not items:
+            # Retry once with a broader query for better resilience.
+            broad_query = " ".join(clean_query.split()[:5])
+            if broad_query != clean_query:
+                retry_params = {**params, "q": broad_query}
+                retry_response = requests.get(url, params=retry_params, timeout=12)
+                retry_response.raise_for_status()
+                items = retry_response.json().get("items", [])
 
-        book_info = data["items"][0]["volumeInfo"]
-        title = book_info.get("title", "Unknown Title")
+        if not items:
+            return (
+                f"I could not find strong matches for '{clean_query}'. "
+                "Try adding an author name, genre, or a more specific topic."
+            )
 
-        print(f"[Tool] Found book: {title}")
-        return f"Recommended book: {title}"
+        recommendations = []
+        for idx, item in enumerate(items[:3], start=1):
+            info = item.get("volumeInfo", {})
+            title = info.get("title", "Unknown Title")
+            authors = ", ".join(info.get("authors", ["Unknown Author"]))
+            published = info.get("publishedDate", "N/A")
+            categories = ", ".join(info.get("categories", ["General"]))
+            rating = info.get("averageRating")
+            ratings_count = info.get("ratingsCount")
+            snippet = (
+                info.get("description", "No description available.")[:240].strip()
+            )
+            if len(info.get("description", "")) > 240:
+                snippet += "..."
+            preview = info.get("previewLink", "")
 
+            rating_text = (
+                f"{rating}/5 ({ratings_count} ratings)"
+                if rating is not None and ratings_count is not None
+                else "No public rating yet"
+            )
+            preview_line = f"\nPreview: {preview}" if preview else ""
+
+            recommendations.append(
+                (
+                    f"{idx}. {title}\n"
+                    f"   Author(s): {authors}\n"
+                    f"   Published: {published}\n"
+                    f"   Category: {categories}\n"
+                    f"   Rating: {rating_text}\n"
+                    f"   Why it fits: {snippet}{preview_line}"
+                )
+            )
+
+        print(f"[Tool] Found {len(recommendations)} matching books")
+        return (
+            f"Top book matches for '{clean_query}':\n\n"
+            + "\n\n".join(recommendations)
+            + "\n\nUse these options to suggest the best fit based on the user's goal."
+        )
+
+    except requests.exceptions.Timeout:
+        print("[Tool ERROR] Google Books request timed out")
+        return (
+            "The book service took too long to respond. "
+            "Please try again in a moment or refine the query."
+        )
+    except requests.exceptions.RequestException as e:
+        print(f"[Tool ERROR] {e}")
+        return (
+            "Book search service is temporarily unavailable. "
+            "Please retry shortly."
+        )
     except Exception as e:
         print(f"[Tool ERROR] {e}")
         return f"Error: {str(e)}"
@@ -305,6 +375,7 @@ llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
 system_instructions = (
     "You are a helpful AI assistant. "
+    "For book recommendations, specific titles, or author/topic lookup, always call the BookSearch tool first. "
     "Use tools when necessary. Be concise and direct."
 )
 
