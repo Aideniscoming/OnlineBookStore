@@ -297,20 +297,20 @@ def BookSearch(query: str) -> str:
 
             recommendations.append(
                 (
-                    f"{idx}. {title}\n"
-                    f"   Author(s): {authors}\n"
-                    f"   Published: {published}\n"
-                    f"   Category: {categories}\n"
-                    f"   Rating: {rating_text}\n"
-                    f"   Why it fits: {snippet}{preview_line}"
+                    f"- **{idx}. {title}**\n"
+                    f"  - Author(s): {authors}\n"
+                    f"  - Published: {published}\n"
+                    f"  - Category: {categories}\n"
+                    f"  - Rating: {rating_text}\n"
+                    f"  - Why it fits: {snippet}{preview_line}"
                 )
             )
 
         print(f"[Tool] Found {len(recommendations)} matching books")
         return (
-            f"Top book matches for '{clean_query}':\n\n"
+            f"## Top book matches for '{clean_query}'\n\n"
             + "\n\n".join(recommendations)
-            + "\n\nUse these options to suggest the best fit based on the user's goal."
+            + "\n\nAsk the user a short follow-up question to narrow the final recommendation."
         )
 
     except requests.exceptions.Timeout:
@@ -376,7 +376,10 @@ llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 system_instructions = (
     "You are a helpful AI assistant. "
     "For book recommendations, specific titles, or author/topic lookup, always call the BookSearch tool first. "
-    "Use tools when necessary. Be concise and direct."
+    "Use tools when necessary. Be concise and direct. "
+    "Formatting rules for every final answer: "
+    "use short paragraphs or bullet points with clear line breaks, never one long block of text, "
+    "and end with one short follow-up question to continue the conversation."
 )
 
 agent = create_react_agent(llm, tools=tools, prompt=system_instructions)
