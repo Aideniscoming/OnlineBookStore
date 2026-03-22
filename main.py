@@ -189,6 +189,7 @@
 #     main()
 
 import os
+import re
 import requests
 from dotenv import load_dotenv
 
@@ -240,6 +241,86 @@ def _book_link_token(volume_id: str, title: str) -> str:
         return title
     safe_title = title.replace("|", "·").replace("]", "›")
     return f"[[BOOK:{volume_id}|{safe_title}]]"
+
+
+# --- "Title" by Author → Google Books volume id (post-process when model skips BookSearch) ---
+_RE_QUOTED_BOOK_BY = re.compile(
+    r'(?P<q>["\u201c\u201d])(?P<title>[^"\u201c\u201d]+)(?P=q)\s+by\s+(?P<author>[^\n*]+?)(?=\s*\*\*|\s*$|\n)',
+    re.MULTILINE,
+)
+
+
+def _google_books_resolve_volume_id(title: str, author: str) -> str | None:
+    """Return first matching Google Books volume id for title + author."""
+    title = title.strip()
+    author = re.sub(r"\s*\*\*\s*$", "", author.strip()).strip()
+    if not title or not author:
+        return None
+
+    url = "https://www.googleapis.com/books/v1/volumes"
+    api_key = os.getenv("GOOGLE_BOOKS_API_KEY") or os.getenv("VITE_GOOGLE_BOOKS_API_KEY")
+    # Generic query first (works best for multi-word titles); then field filters.
+    attempts = [
+        {"q": f"{title} {author}", "maxResults": 5},
+        {"q": f'intitle:{title} inauthor:{author.split()[0]}', "maxResults": 5},
+        {"q": f'intitle:{title} inauthor:{author}', "maxResults": 5},
+    ]
+    for params in attempts:
+        p = {
+            **params,
+            "printType": "books",
+        }
+        if api_key:
+            p["key"] = api_key
+        try:
+            r = requests.get(url, params=p, timeout=8)
+            r.raise_for_status()
+            data = r.json()
+            if data.get("error"):
+                continue
+            items = data.get("items") or []
+            for it in items:
+                vid = it.get("id")
+                if vid:
+                    return vid
+        except (requests.RequestException, ValueError, KeyError, TypeError):
+            continue
+    return None
+
+
+def enrich_reply_with_book_links(text: str) -> str:
+    """
+    If the model answered from memory (no [[BOOK:...]]), resolve 'Title' by Author
+    lines and inject link tokens so the frontend can render /book/:id links.
+    """
+    if not text:
+        return text
+
+    matches = list(_RE_QUOTED_BOOK_BY.finditer(text))
+    if not matches:
+        return text
+
+    cache: dict[tuple[str, str], str | None] = {}
+    out: list[str] = []
+    pos = 0
+    for m in matches:
+        title = m.group("title").strip()
+        author = m.group("author").strip()
+        key = (title.lower(), author.lower())
+        if key not in cache:
+            cache[key] = _google_books_resolve_volume_id(title, author)
+        vid = cache[key]
+
+        out.append(text[pos : m.start()])
+        if vid:
+            out.append(_book_link_token(vid, title))
+            out.append(f" by {author}")
+        else:
+            out.append(m.group(0))
+        pos = m.end()
+
+    out.append(text[pos:])
+    return "".join(out)
 
 
 @tool
@@ -387,7 +468,8 @@ llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
 system_instructions = (
     "You are a helpful AI assistant. "
-    "For book recommendations, specific titles, or author/topic lookup, always call the BookSearch tool first. "
+    "For book recommendations, specific titles, or author/topic lookup, always call the BookSearch tool first "
+    "and base recommendations on its results. Do not list books purely from memory when the user asks for books. "
     "Use tools when necessary. Be concise and direct. "
     "Formatting rules for every final answer: "
     "use short paragraphs or bullet points with clear line breaks, never one long block of text, "
@@ -449,6 +531,7 @@ def chat(req: ChatRequest):
 
         conversation = response["messages"]
         final_message = conversation[-1].content
+        final_message = enrich_reply_with_book_links(final_message or "")
 
         print("[6] Agent response generated")
         print(f"[AI] {final_message}")
