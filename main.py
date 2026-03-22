@@ -233,6 +233,15 @@ conversation = []
 # ---------------------------
 search_tool = DuckDuckGoSearchRun()
 
+
+def _book_link_token(volume_id: str, title: str) -> str:
+    """Embed Google Books volume id for frontend links to /book/:id."""
+    if not volume_id:
+        return title
+    safe_title = title.replace("|", "·").replace("]", "›")
+    return f"[[BOOK:{volume_id}|{safe_title}]]"
+
+
 @tool
 def BookSearch(query: str) -> str:
     """Search Google Books and return curated book recommendations with details."""
@@ -274,8 +283,10 @@ def BookSearch(query: str) -> str:
 
         recommendations = []
         for idx, item in enumerate(items[:3], start=1):
+            volume_id = item.get("id") or ""
             info = item.get("volumeInfo", {})
             title = info.get("title", "Unknown Title")
+            title_with_link = _book_link_token(volume_id, title)
             authors = ", ".join(info.get("authors", ["Unknown Author"]))
             published = info.get("publishedDate", "N/A")
             categories = ", ".join(info.get("categories", ["General"]))
@@ -297,7 +308,7 @@ def BookSearch(query: str) -> str:
 
             recommendations.append(
                 (
-                    f"- **{idx}. {title}**\n"
+                    f"- **{idx}.** {title_with_link}\n"
                     f"  - Author(s): {authors}\n"
                     f"  - Published: {published}\n"
                     f"  - Category: {categories}\n"
@@ -310,7 +321,8 @@ def BookSearch(query: str) -> str:
         return (
             f"## Top book matches for '{clean_query}'\n\n"
             + "\n\n".join(recommendations)
-            + "\n\nAsk the user a short follow-up question to narrow the final recommendation."
+            + "\n\nWhen you summarize for the user, copy each [[BOOK:volumeId|Title]] token exactly "
+            "so titles stay clickable in the app. Ask one short follow-up question."
         )
 
     except requests.exceptions.Timeout:
@@ -379,7 +391,9 @@ system_instructions = (
     "Use tools when necessary. Be concise and direct. "
     "Formatting rules for every final answer: "
     "use short paragraphs or bullet points with clear line breaks, never one long block of text, "
-    "and end with one short follow-up question to continue the conversation."
+    "and end with one short follow-up question to continue the conversation. "
+    "Whenever BookSearch returns [[BOOK:volumeId|Title]] tokens, preserve them verbatim next to each book title "
+    "so the storefront can link to /book/volumeId. Do not invent volume IDs; only use tokens from tool output."
 )
 
 agent = create_react_agent(llm, tools=tools, prompt=system_instructions)
