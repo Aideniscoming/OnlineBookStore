@@ -244,10 +244,30 @@ def _book_link_token(volume_id: str, title: str) -> str:
 
 
 # --- "Title" by Author → Google Books volume id (post-process when model skips BookSearch) ---
+# Must match frontend Ai.jsx so both can inject [[BOOK:id|title]] tokens.
 _RE_QUOTED_BOOK_BY = re.compile(
-    r'(?P<q>["\u201c\u201d])(?P<title>[^"\u201c\u201d]+)(?P=q)\s+by\s+(?P<author>[^\n*]+?)(?=\s*\*\*|\s*$|\n)',
+    r'(?P<q>["\u201c\u201d])(?P<title>[^\n"\u201c\u201d]+?)(?P=q)\s+by\s+(?P<author>[^\n*]+?)(?=\s*\*\*|\s*$|\n)',
     re.MULTILINE,
 )
+
+
+def _stringify_ai_content(content) -> str:
+    """LangChain may return list/dict multimodal content; normalize to plain string."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                t = block.get("text") or block.get("content")
+                if isinstance(t, str):
+                    parts.append(t)
+        return "".join(parts)
+    return str(content)
 
 
 def _google_books_resolve_volume_id(title: str, author: str) -> str | None:
@@ -530,8 +550,8 @@ def chat(req: ChatRequest):
         response = agent.invoke({"messages": conversation})
 
         conversation = response["messages"]
-        final_message = conversation[-1].content
-        final_message = enrich_reply_with_book_links(final_message or "")
+        final_message = _stringify_ai_content(conversation[-1].content)
+        final_message = enrich_reply_with_book_links(final_message)
 
         print("[6] Agent response generated")
         print(f"[AI] {final_message}")
