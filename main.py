@@ -235,213 +235,96 @@ conversation = []
 search_tool = DuckDuckGoSearchRun()
 
 
-def _book_link_token(volume_id: str, title: str) -> str:
-    """Embed Google Books volume id for frontend links to /book/:id."""
-    if not volume_id:
-        return title
-    safe_title = title.replace("|", "·").replace("]", "›")
-    return f"[[BOOK:{volume_id}|{safe_title}]]"
-
-
-# --- "Title" by Author → Google Books volume id (post-process when model skips BookSearch) ---
-# Must match frontend Ai.jsx so both can inject [[BOOK:id|title]] tokens.
-_RE_QUOTED_BOOK_BY = re.compile(
-    r'(?P<q>["\u201c\u201d])(?P<title>[^\n"\u201c\u201d]+?)(?P=q)\s+by\s+(?P<author>[^\n*]+?)(?=\s*\*\*|\s*$|\n)',
-    re.MULTILINE,
-)
-
-
-def _stringify_ai_content(content) -> str:
-    """LangChain may return list/dict multimodal content; normalize to plain string."""
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for block in content:
-            if isinstance(block, str):
-                parts.append(block)
-            elif isinstance(block, dict):
-                t = block.get("text") or block.get("content")
-                if isinstance(t, str):
-                    parts.append(t)
-        return "".join(parts)
-    return str(content)
-
-
-def _google_books_resolve_volume_id(title: str, author: str) -> str | None:
-    """Return first matching Google Books volume id for title + author."""
-    title = title.strip()
-    author = re.sub(r"\s*\*\*\s*$", "", author.strip()).strip()
-    if not title or not author:
-        return None
-
-    url = "https://www.googleapis.com/books/v1/volumes"
-    api_key = os.getenv("GOOGLE_BOOKS_API_KEY") or os.getenv("VITE_GOOGLE_BOOKS_API_KEY")
-    # Generic query first (works best for multi-word titles); then field filters.
-    attempts = [
-        {"q": f"{title} {author}", "maxResults": 5},
-        {"q": f'intitle:{title} inauthor:{author.split()[0]}', "maxResults": 5},
-        {"q": f'intitle:{title} inauthor:{author}', "maxResults": 5},
-    ]
-    for params in attempts:
-        p = {
-            **params,
-            "printType": "books",
-        }
-        if api_key:
-            p["key"] = api_key
-        try:
-            r = requests.get(url, params=p, timeout=8)
-            r.raise_for_status()
-            data = r.json()
-            if data.get("error"):
-                continue
-            items = data.get("items") or []
-            for it in items:
-                vid = it.get("id")
-                if vid:
-                    return vid
-        except (requests.RequestException, ValueError, KeyError, TypeError):
-            continue
-    return None
-
-
-def enrich_reply_with_book_links(text: str) -> str:
-    """
-    If the model answered from memory (no [[BOOK:...]]), resolve 'Title' by Author
-    lines and inject link tokens so the frontend can render /book/:id links.
-    """
-    if not text:
-        return text
-
-    matches = list(_RE_QUOTED_BOOK_BY.finditer(text))
-    if not matches:
-        return text
-
-    cache: dict[tuple[str, str], str | None] = {}
-    out: list[str] = []
-    pos = 0
-    for m in matches:
-        title = m.group("title").strip()
-        author = m.group("author").strip()
-        key = (title.lower(), author.lower())
-        if key not in cache:
-            cache[key] = _google_books_resolve_volume_id(title, author)
-        vid = cache[key]
-
-        out.append(text[pos : m.start()])
-        if vid:
-            out.append(_book_link_token(vid, title))
-            out.append(f" by {author}")
-        else:
-            out.append(m.group(0))
-        pos = m.end()
-
-    out.append(text[pos:])
-    return "".join(out)
-
-
 @tool
 def BookSearch(query: str) -> str:
-    """Search Google Books and return curated book recommendations with details."""
-    print(f"[Tool] BookSearch called with query: {query}")
+    """
+    Search Google Books API for books matching the user's query.
+    Returns up to 4 results, each with id, title, authors, short description,
+    and a suitability note explaining why the book fits the request.
+    Each book is tagged with a [[BOOK:volumeId|Title]] token for frontend linking.
 
+    Args:
+        query (str): Keywords from the user's message (e.g. 'beginner Python programming',
+                     'romantic historical fiction', 'mindfulness for anxiety').
+
+    Returns:
+        str: Formatted multi-book recommendations with [[BOOK:id|Title]] tokens.
+    """
     url = "https://www.googleapis.com/books/v1/volumes"
-    clean_query = query.strip()
-    if not clean_query:
-        return "Please provide a topic, title, or author so I can search for books."
-
     params = {
-        "q": clean_query,
-        "maxResults": 5,
+        "q": query,
+        "maxResults": 4,
         "printType": "books",
         "orderBy": "relevance",
-        "langRestrict": "en",
     }
 
     try:
-        response = requests.get(url, params=params, timeout=12)
+        response = requests.get(url, params=params, timeout=8)
         response.raise_for_status()
         data = response.json()
 
-        items = data.get("items", [])
-        if not items:
-            # Retry once with a broader query for better resilience.
-            broad_query = " ".join(clean_query.split()[:5])
-            if broad_query != clean_query:
-                retry_params = {**params, "q": broad_query}
-                retry_response = requests.get(url, params=retry_params, timeout=12)
-                retry_response.raise_for_status()
-                items = retry_response.json().get("items", [])
-
-        if not items:
+        if "items" not in data or not data["items"]:
             return (
-                f"I could not find strong matches for '{clean_query}'. "
-                "Try adding an author name, genre, or a more specific topic."
+                f"[BookSearch] No results found for '{query}'. "
+                "The search is temporarily unavailable or returned no matches. "
+                "Please ask the user to retry or try different keywords."
             )
 
-        recommendations = []
-        for idx, item in enumerate(items[:3], start=1):
-            volume_id = item.get("id") or ""
+        results = []
+        for item in data["items"][:4]:
             info = item.get("volumeInfo", {})
-            title = info.get("title", "Unknown Title")
-            title_with_link = _book_link_token(volume_id, title)
+            volume_id = item.get("id", "unknown")
+
+            title   = info.get("title", "Unknown Title")
             authors = ", ".join(info.get("authors", ["Unknown Author"]))
-            published = info.get("publishedDate", "N/A")
-            categories = ", ".join(info.get("categories", ["General"]))
-            rating = info.get("averageRating")
-            ratings_count = info.get("ratingsCount")
-            snippet = (
-                info.get("description", "No description available.")[:240].strip()
-            )
-            if len(info.get("description", "")) > 240:
-                snippet += "..."
-            preview = info.get("previewLink", "")
+            pub_date = info.get("publishedDate", "N/A")[:4]  # year only
+            raw_desc = info.get("description", "")
 
-            rating_text = (
-                f"{rating}/5 ({ratings_count} ratings)"
-                if rating is not None and ratings_count is not None
-                else "No public rating yet"
-            )
-            preview_line = f"\nPreview: {preview}" if preview else ""
-
-            recommendations.append(
-                (
-                    f"- **{idx}.** {title_with_link}\n"
-                    f"  - Author(s): {authors}\n"
-                    f"  - Published: {published}\n"
-                    f"  - Category: {categories}\n"
-                    f"  - Rating: {rating_text}\n"
-                    f"  - Why it fits: {snippet}{preview_line}"
+            # Trim description to a clean sentence boundary (~200 chars)
+            if len(raw_desc) > 220:
+                trimmed = raw_desc[:220]
+                cutoff = max(
+                    trimmed.rfind(". "),
+                    trimmed.rfind("! "),
+                    trimmed.rfind("? "),
                 )
+                short_desc = (trimmed[: cutoff + 1] if cutoff > 80 else trimmed) + "…"
+            else:
+                short_desc = raw_desc if raw_desc else "No description available."
+
+            # Suitability note — surface keywords from query vs book metadata
+            query_words = set(query.lower().split())
+            desc_lower  = (raw_desc + " " + title).lower()
+            matched     = [w for w in query_words if len(w) > 3 and w in desc_lower]
+            if matched:
+                suitability = (
+                    f"Directly relevant to your interest in "
+                    f"{', '.join(matched[:3])} — covers this topic from the ground up."
+                )
+            else:
+                categories = info.get("categories", [])
+                cat_str    = f" in {', '.join(categories[:2])}" if categories else ""
+                suitability = (
+                    f"A well-matched result{cat_str} based on your search for '{query}'."
+                )
+
+            book_token = f"[[BOOK:{volume_id}|{title}]]"
+
+            results.append(
+                f"### {book_token}\n"
+                f"**Authors:** {authors} ({pub_date})\n"
+                f"**About:** {short_desc}\n"
+                f"**Why it fits:** {suitability}"
             )
 
-        print(f"[Tool] Found {len(recommendations)} matching books")
-        return (
-            f"## Top book matches for '{clean_query}'\n\n"
-            + "\n\n".join(recommendations)
-            + "\n\nWhen you summarize for the user, copy each [[BOOK:volumeId|Title]] token exactly "
-            "so titles stay clickable in the app. Ask one short follow-up question."
-        )
+        return "\n\n---\n\n".join(results)
 
     except requests.exceptions.Timeout:
-        print("[Tool ERROR] Google Books request timed out")
-        return (
-            "The book service took too long to respond. "
-            "Please try again in a moment or refine the query."
-        )
+        return "[BookSearch] Request timed out. Please ask the user to try again."
     except requests.exceptions.RequestException as e:
-        print(f"[Tool ERROR] {e}")
-        return (
-            "Book search service is temporarily unavailable. "
-            "Please retry shortly."
-        )
+        return f"[BookSearch] Network error contacting Google Books: {str(e)}"
     except Exception as e:
-        print(f"[Tool ERROR] {e}")
-        return f"Error: {str(e)}"
-
+        return f"[BookSearch] Unexpected error: {str(e)}"
 
 @tool
 def calculator(a: float, b: float, operation: str = "add") -> str:
@@ -488,8 +371,11 @@ llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
 system_instructions = (
     "You are a helpful AI assistant. "
-    "For book recommendations, specific titles, or author/topic lookup, always call the BookSearch tool first "
-    "and base recommendations on its results. Do not list books purely from memory when the user asks for books. "
+    "Whenever the user asks for book recommendations, genres, or examples of books, you MUST call the BookSearch tool "
+    "with a short query (e.g. 'romance novels', 'horror', or the user's topic) before answering. "
+    "If BookSearch returns an error, say the search is temporarily unavailable and ask them to retry—do NOT fill in "
+    "a list of books from memory as a substitute. "
+    "Do not claim you 'cannot access the book database' unless the tool actually failed after you called it. "
     "Use tools when necessary. Be concise and direct. "
     "Formatting rules for every final answer: "
     "use short paragraphs or bullet points with clear line breaks, never one long block of text, "
@@ -553,11 +439,24 @@ def chat(req: ChatRequest):
         final_message = _stringify_ai_content(conversation[-1].content)
         final_message = enrich_reply_with_book_links(final_message)
 
+        # Split off the last non-empty line as the follow-up prompt
+        lines = final_message.strip().split("\n")
+        non_empty = [(i, l) for i, l in enumerate(lines) if l.strip()]
+        
+        if len(non_empty) >= 2:
+            last_idx, prompt_line = non_empty[-1]
+            body = "\n".join(lines[:last_idx]).strip()
+        else:
+            # Only one line — don't split it
+            body = final_message.strip()
+            prompt_line = ""
+
         print("[6] Agent response generated")
-        print(f"[AI] {final_message}")
+        print(f"[AI body] {body}")
+        print(f"[AI prompt] {prompt_line}")
         print("================================\n")
 
-        return {"reply": final_message}
+        return {"reply": body, "prompt": prompt_line}
 
     except Exception as e:
         print("[ERROR]", str(e))
