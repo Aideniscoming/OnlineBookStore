@@ -20,6 +20,9 @@ load_dotenv()
 if not os.getenv("OPENAI_API_KEY") and os.getenv("OPEN_API_KEY"):
     os.environ["OPENAI_API_KEY"] = os.getenv("OPEN_API_KEY", "")
 
+# Google Books API key — set GOOGLE_BOOKS_API_KEY in your Render environment variables
+GOOGLE_BOOKS_API_KEY = os.getenv("GOOGLE_BOOKS_API_KEY", "")
+
 # ---------------------------
 # FastAPI app
 # ---------------------------
@@ -28,7 +31,7 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -39,11 +42,10 @@ app.add_middleware(
 conversation = []
 
 # ---------------------------
-# Helper: safely convert AI message content to a plain string.
-# LangChain sometimes returns a list of content blocks instead of a string
-# (e.g. [{"type": "text", "text": "..."}]) — this handles both cases.
+# Helpers
 # ---------------------------
 def _stringify_ai_content(content) -> str:
+    """Safely convert LangChain AI message content to a plain string."""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -56,24 +58,14 @@ def _stringify_ai_content(content) -> str:
         return "".join(parts)
     return str(content)
 
-# ---------------------------
-# Helper: ensure [[BOOK:id|Title]] tokens from the BookSearch tool
-# are preserved verbatim in the final reply.
-# The LLM sometimes reformats them (e.g. wraps in markdown bold or
-# drops the brackets) — this function restores any that got mangled
-# by scanning the raw tool output stored in the conversation.
-# If the tokens are already intact, this is a no-op.
-# ---------------------------
-def enrich_reply_with_book_links(reply: str) -> str:
-    # Tokens are already intact — nothing to do
-    TOKEN_RE = re.compile(r'\[\[BOOK:[^\]|]+\|[^\]]+\]\]')
-    if TOKEN_RE.search(reply):
-        print("[enrich] Tokens already present in reply — no enrichment needed.")
-        return reply
 
-    # Tokens missing — log a warning so we can diagnose
-    print("[enrich] WARNING: No [[BOOK:...]] tokens found in reply.")
-    print("[enrich] Reply text:", repr(reply[:300]))
+def enrich_reply_with_book_links(reply: str) -> str:
+    """Verify [[BOOK:...]] tokens survived the LLM response. Logs if missing."""
+    if re.search(r'\[\[BOOK:[^\]|]+\|[^\]]+\]\]', reply):
+        print("[enrich] Tokens present — OK.")
+    else:
+        print("[enrich] WARNING: No [[BOOK:...]] tokens in reply.")
+        print("[enrich] Reply:", repr(reply[:400]))
     return reply
 
 # ---------------------------
@@ -87,6 +79,7 @@ def BookSearch(query: str) -> str:
     """
     Search Google Books API for books matching the user's query.
     Returns up to 4 results each tagged with [[BOOK:volumeId|Title]] tokens.
+    MUST be called for any book-related request.
 
     Args:
         query (str): Keywords from the user's message.
@@ -94,6 +87,8 @@ def BookSearch(query: str) -> str:
     Returns:
         str: Formatted book list with [[BOOK:id|Title]] tokens.
     """
+    print(f"[BookSearch] query='{query}' | API key set: {bool(GOOGLE_BOOKS_API_KEY)}")
+
     url = "https://www.googleapis.com/books/v1/volumes"
     params = {
         "q": query,
@@ -102,16 +97,19 @@ def BookSearch(query: str) -> str:
         "orderBy": "relevance",
     }
 
+    # Always include the API key — required for reliable access on hosted servers
+    if GOOGLE_BOOKS_API_KEY:
+        params["key"] = GOOGLE_BOOKS_API_KEY
+
     try:
         response = requests.get(url, params=params, timeout=8)
+        print(f"[BookSearch] HTTP {response.status_code}")
         response.raise_for_status()
         data = response.json()
 
         if "items" not in data or not data["items"]:
-            return (
-                f"[BookSearch] No results found for '{query}'. "
-                "Search unavailable or no matches. Ask the user to retry."
-            )
+            print("[BookSearch] No items returned.")
+            return f"[BookSearch] No results found for '{query}'. Ask the user to retry."
 
         results = []
         for item in data["items"][:4]:
@@ -121,7 +119,6 @@ def BookSearch(query: str) -> str:
             authors = ", ".join(info.get("authors", ["Unknown Author"]))
             raw_desc = info.get("description", "")
 
-            # Trim description to a clean sentence boundary
             if len(raw_desc) > 220:
                 trimmed = raw_desc[:220]
                 cutoff = max(
@@ -133,20 +130,20 @@ def BookSearch(query: str) -> str:
             else:
                 short_desc = raw_desc if raw_desc else "No description available."
 
-            book_token = f"[[BOOK:{volume_id}|{title}]]"
+            results.append(f"- [[BOOK:{volume_id}|{title}]] by {authors} — {short_desc}")
 
-            # One clean line per book: token + author + description
-            results.append(f"- {book_token} by {authors} — {short_desc}")
-
-        tool_output = "\n".join(results)
-        print(f"[BookSearch] Tool output:\n{tool_output}")
-        return tool_output
+        output = "\n".join(results)
+        print(f"[BookSearch] Returning {len(results)} books.")
+        return output
 
     except requests.exceptions.Timeout:
+        print("[BookSearch] Timed out.")
         return "[BookSearch] Request timed out. Ask the user to retry."
     except requests.exceptions.RequestException as e:
+        print(f"[BookSearch] Network error: {e}")
         return f"[BookSearch] Network error: {str(e)}"
     except Exception as e:
+        print(f"[BookSearch] Unexpected error: {e}")
         return f"[BookSearch] Unexpected error: {str(e)}"
 
 
@@ -168,16 +165,13 @@ def calculator(a: float, b: float, operation: str = "add") -> str:
 def save_conversation(filename: str = "conversation.txt") -> str:
     """Save the current in-memory conversation to a text file."""
     global conversation
-
     folder = "history_conversation"
     os.makedirs(folder, exist_ok=True)
     filepath = os.path.join(folder, filename)
-
     with open(filepath, "w", encoding="utf-8") as f:
         for message in conversation:
             role = getattr(message, "type", "MESSAGE").upper()
             f.write(f"{role}: {getattr(message, 'content', '')}\n")
-
     return f"Saved to {filepath}"
 
 
@@ -191,21 +185,21 @@ llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 system_instructions = (
     "You are a helpful AI book assistant for an online bookstore. "
 
-    "You MUST call the BookSearch tool for ANY request involving books, genres, authors, "
-    "recommendations, or examples — no exceptions. "
-    "You are FORBIDDEN from listing, naming, or describing any books from memory. "
-    "If BookSearch returns an error or no results, say the search is temporarily unavailable "
-    "and ask the user to retry — do NOT substitute books from your own knowledge. "
+    "RULE 1 — ALWAYS USE TOOL: You MUST call the BookSearch tool for ANY request "
+    "involving books, genres, authors, or recommendations. No exceptions. "
+    "You are completely forbidden from naming, listing, or describing books from memory. "
+    "If BookSearch returns a string starting with '[BookSearch]', that is an error — "
+    "tell the user the search is temporarily unavailable and ask them to retry. "
+    "Do NOT fall back to books from memory under any circumstance. "
 
-    "After calling BookSearch, format your reply EXACTLY as follows:\n"
-    "1. One short conversational sentence introducing the results.\n"
-    "2. Copy each book line from the tool output EXACTLY as-is — do NOT rewrite, "
-    "   reformat, or remove the [[BOOK:volumeId|Title]] tokens. Each book is already "
-    "   formatted as: - [[BOOK:id|Title]] by Author — description. Keep it exactly that way.\n"
-    "3. End with one short follow-up question on its own line.\n"
+    "RULE 2 — FORMAT: After BookSearch returns results, reply exactly as follows:\n"
+    "  Line 1: One short sentence introducing the results.\n"
+    "  Lines 2+: Copy each '- [[BOOK:id|Title]] by Author — description' line from "
+    "the tool output VERBATIM. Do not rewrite, reformat, or remove the [[ ]] tokens.\n"
+    "  Last line: One short follow-up question.\n"
 
-    "Never nest bullet points. Never add sub-bullets. Each book must be exactly one line. "
-    "Never invent or modify volume IDs. Never remove the [[ or ]] brackets."
+    "RULE 3 — TOKENS: Never modify, remove, or invent [[BOOK:id|Title]] tokens. "
+    "Copy them exactly as returned by the tool."
 )
 
 agent = create_react_agent(llm, tools=tools, prompt=system_instructions)
@@ -224,9 +218,24 @@ class ChatRequest(BaseModel):
 def root():
     return {"status": "ok", "service": "AI_assistance API", "chat_endpoint": "/chat"}
 
+
 @app.get("/health")
 def health():
     return {"status": "healthy"}
+
+
+# Diagnostic: test BookSearch directly without going through the LLM
+# Usage: GET /test-booksearch?query=horror
+@app.get("/test-booksearch")
+def test_booksearch(query: str = "horror"):
+    result = BookSearch.func(query)
+    return {
+        "query": query,
+        "api_key_set": bool(GOOGLE_BOOKS_API_KEY),
+        "has_tokens": "[[BOOK:" in result,
+        "result": result,
+    }
+
 
 @app.post("/chat")
 def chat(req: ChatRequest):
@@ -242,17 +251,16 @@ def chat(req: ChatRequest):
         response = agent.invoke({"messages": conversation})
         conversation = response["messages"]
 
+        # Log message chain to confirm BookSearch was called
+        print(f"[2] Message chain ({len(conversation)} messages):")
+        for i, msg in enumerate(conversation):
+            print(f"    [{i}] {type(msg).__name__}: {repr(getattr(msg, 'content', ''))[:200]}")
+
         raw_content = conversation[-1].content
-        print(f"[2] Raw AI content type: {type(raw_content)}")
-        print(f"[3] Raw AI content: {repr(raw_content)[:500]}")
-
         final_message = _stringify_ai_content(raw_content)
-        print(f"[4] Stringified: {repr(final_message)[:500]}")
-
         final_message = enrich_reply_with_book_links(final_message)
-        print(f"[5] After enrich: {repr(final_message)[:500]}")
 
-        # Split the last non-empty line off as the follow-up prompt
+        # Split last non-empty line off as the follow-up prompt
         lines = final_message.strip().split("\n")
         non_empty = [(i, l) for i, l in enumerate(lines) if l.strip()]
 
@@ -263,12 +271,14 @@ def chat(req: ChatRequest):
             body = final_message.strip()
             prompt_line = ""
 
-        print(f"[6] Body: {repr(body)[:400]}")
-        print(f"[7] Prompt: {repr(prompt_line)}")
-        print("================================\n")
+        print(f"[3] Body: {repr(body[:400])}")
+        print(f"[4] Prompt: {repr(prompt_line)}")
+        print("=================================\n")
 
         return {"reply": body, "prompt": prompt_line}
 
     except Exception as e:
+        import traceback
         print(f"[ERROR] {str(e)}")
+        print(traceback.format_exc())
         return {"reply": "Error processing request", "prompt": ""}
